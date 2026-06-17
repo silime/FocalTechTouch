@@ -30,6 +30,226 @@
 #include <selftest\selftest.h>
 #include <selftest.tmh>
 
+#define FT5X06_REG_DEVICE_MODE        0x00
+#define FT5X06_REG_FACTORY_COMMAND    0x02
+#define FT5X06_REG_STATE              0xA7
+#define FT5X06_REG_ERROR              0xA9
+
+#define FT5X06_DEVICE_MODE_MASK       0x70
+#define FT5X06_DEVICE_MODE_WORK       0x00
+#define FT5X06_DEVICE_MODE_FACTORY    0x40
+
+#define FT5X06_STATE_WORK             0x01
+#define FT5X06_STATE_CALIBRATION      0x02
+#define FT5X06_STATE_FACTORY          0x03
+
+#define FT5X06_FACTORY_CMD_CALIBRATE  0x04
+#define FT5X06_FACTORY_CMD_STORE      0x05
+
+#define TOUCH_CALIBRATION_TIMEOUT_MS       5000
+#define TOUCH_CALIBRATION_POLL_INTERVAL_MS 100
+
+static
+VOID
+TchSelfTestDelayMs(
+    IN ULONG Milliseconds
+    )
+{
+    LARGE_INTEGER delay;
+
+    delay.QuadPart = WDF_REL_TIMEOUT_IN_MS(Milliseconds);
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+}
+
+static
+NTSTATUS
+TchSelfTestWriteRegister(
+    IN PDEVICE_EXTENSION DevContext,
+    IN UCHAR Register,
+    IN UCHAR Value
+    )
+{
+    return SpbWriteDataSynchronously(
+        &DevContext->I2CContext,
+        Register,
+        &Value,
+        sizeof(Value));
+}
+
+static
+NTSTATUS
+TchSelfTestReadRegister(
+    IN PDEVICE_EXTENSION DevContext,
+    IN UCHAR Register,
+    OUT UCHAR* Value
+    )
+{
+    return SpbReadDataSynchronously(
+        &DevContext->I2CContext,
+        Register,
+        Value,
+        sizeof(*Value));
+}
+
+static
+NTSTATUS
+TchSelfTestReadCalibrationStatus(
+    IN PDEVICE_EXTENSION DevContext,
+    IN PTOUCH_SELFTEST_CALIBRATION Calibration
+    )
+{
+    NTSTATUS status;
+
+    status = TchSelfTestReadRegister(
+        DevContext,
+        FT5X06_REG_DEVICE_MODE,
+        &Calibration->FinalDeviceMode);
+
+    if (NT_SUCCESS(status))
+    {
+        status = TchSelfTestReadRegister(
+            DevContext,
+            FT5X06_REG_STATE,
+            &Calibration->FinalState);
+    }
+
+    if (NT_SUCCESS(status))
+    {
+        status = TchSelfTestReadRegister(
+            DevContext,
+            FT5X06_REG_ERROR,
+            &Calibration->ErrorCode);
+    }
+
+    return status;
+}
+
+static
+NTSTATUS
+TchSelfTestRunFactoryCalibration(
+    IN PDEVICE_EXTENSION DevContext,
+    IN OUT PTOUCH_SELFTEST_CALIBRATION Calibration
+    )
+{
+    NTSTATUS status;
+    ULONG timeoutMs;
+    ULONG pollIntervalMs;
+    ULONG elapsedMs;
+
+    timeoutMs = Calibration->TimeoutMs == 0 ?
+        TOUCH_CALIBRATION_TIMEOUT_MS : Calibration->TimeoutMs;
+    pollIntervalMs = Calibration->PollIntervalMs == 0 ?
+        TOUCH_CALIBRATION_POLL_INTERVAL_MS : Calibration->PollIntervalMs;
+
+    if (pollIntervalMs == 0 || pollIntervalMs > timeoutMs)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Calibration->PollCount = 0;
+    Calibration->OperationStatus = STATUS_UNSUCCESSFUL;
+    Calibration->FinalDeviceMode = 0;
+    Calibration->FinalState = 0;
+    Calibration->ErrorCode = 0;
+    Calibration->Reserved = 0;
+
+    status = TchSelfTestWriteRegister(
+        DevContext,
+        FT5X06_REG_DEVICE_MODE,
+        FT5X06_DEVICE_MODE_FACTORY);
+    if (!NT_SUCCESS(status))
+    {
+        goto exit;
+    }
+
+    TchSelfTestDelayMs(100);
+
+    status = TchSelfTestWriteRegister(
+        DevContext,
+        FT5X06_REG_FACTORY_COMMAND,
+        FT5X06_FACTORY_CMD_CALIBRATE);
+    if (!NT_SUCCESS(status))
+    {
+        goto exit;
+    }
+
+    TchSelfTestDelayMs(300);
+
+    for (elapsedMs = 0; elapsedMs < timeoutMs; elapsedMs += pollIntervalMs)
+    {
+        status = TchSelfTestReadCalibrationStatus(DevContext, Calibration);
+        if (!NT_SUCCESS(status))
+        {
+            goto exit;
+        }
+
+        Calibration->PollCount++;
+
+        if (Calibration->ErrorCode != 0)
+        {
+            status = STATUS_DEVICE_DATA_ERROR;
+            goto exit;
+        }
+
+        if (((Calibration->FinalDeviceMode & FT5X06_DEVICE_MODE_MASK) ==
+             FT5X06_DEVICE_MODE_WORK) ||
+            Calibration->FinalState == FT5X06_STATE_FACTORY ||
+            Calibration->FinalState == FT5X06_STATE_WORK)
+        {
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        TchSelfTestDelayMs(pollIntervalMs);
+    }
+
+    if (!NT_SUCCESS(status))
+    {
+        goto exit;
+    }
+
+    if (elapsedMs >= timeoutMs)
+    {
+        status = STATUS_IO_TIMEOUT;
+        goto exit;
+    }
+
+    if (Calibration->Flags & TOUCH_SELFTEST_CALIBRATION_FLAG_STORE)
+    {
+        status = TchSelfTestWriteRegister(
+            DevContext,
+            FT5X06_REG_DEVICE_MODE,
+            FT5X06_DEVICE_MODE_FACTORY);
+        if (!NT_SUCCESS(status))
+        {
+            goto exit;
+        }
+
+        TchSelfTestDelayMs(100);
+
+        status = TchSelfTestWriteRegister(
+            DevContext,
+            FT5X06_REG_FACTORY_COMMAND,
+            FT5X06_FACTORY_CMD_STORE);
+        if (!NT_SUCCESS(status))
+        {
+            goto exit;
+        }
+
+        TchSelfTestDelayMs(300);
+    }
+
+exit:
+    Calibration->OperationStatus = status;
+    (VOID)TchSelfTestReadCalibrationStatus(DevContext, Calibration);
+    (VOID)TchSelfTestWriteRegister(
+        DevContext,
+        FT5X06_REG_DEVICE_MODE,
+        FT5X06_DEVICE_MODE_WORK);
+
+    return status;
+}
+
 VOID
 TchSelfTestOnDeviceControl(
     IN WDFQUEUE Queue,
@@ -68,6 +288,7 @@ Return Value:
     NTSTATUS status = STATUS_INVALID_PARAMETER;
     BOOLEAN *requestedDiagnosticMode;
     UCHAR *requestedPage;
+    PTOUCH_SELFTEST_CALIBRATION calibration;
 
 
     devContext = GetDeviceContext(WdfPdoGetParent(WdfIoQueueGetDevice(Queue)));
@@ -254,6 +475,39 @@ Return Value:
             }
 
             WdfRequestSetInformation(Request, sizeof(*requestedPage));
+
+            break;
+        }
+
+        case IOCTL_TOUCH_SELFTEST_CALIBRATE:
+        {
+            if (InputBufferLength < sizeof(TOUCH_SELFTEST_CALIBRATION) ||
+                OutputBufferLength < sizeof(TOUCH_SELFTEST_CALIBRATION))
+            {
+                status = STATUS_INVALID_PARAMETER;
+                goto exit;
+            }
+
+            status = WdfRequestRetrieveInputBuffer(
+                Request,
+                sizeof(TOUCH_SELFTEST_CALIBRATION),
+                (PVOID*)&calibration,
+                NULL);
+
+            if (!NT_SUCCESS(status) ||
+                calibration->Size != sizeof(TOUCH_SELFTEST_CALIBRATION))
+            {
+                status = STATUS_INVALID_PARAMETER;
+                goto exit;
+            }
+
+            status = TchSelfTestRunFactoryCalibration(
+                devContext,
+                calibration);
+
+            WdfRequestSetInformation(
+                Request,
+                sizeof(TOUCH_SELFTEST_CALIBRATION));
 
             break;
         }
