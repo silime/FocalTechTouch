@@ -31,23 +31,23 @@
 // controller coordinates to the physical LCD, as well as
 // any differences between the physical LCD dimensons and
 // viewable LCD area, are required. If not provided for whatever
-// reason, we will use the default panel resolution and orientation.
+// reason, we will assume the touch panel and display are aligned.
 //
 
 TOUCH_SCREEN_PROPERTIES gDefaultProperties =
 {
     0x0,
-    0x1,
-    0x1,
+    0x0,
+    0x0,
+    TOUCH_DEFAULT_RESOLUTION_X,
+    TOUCH_DEFAULT_RESOLUTION_Y,
+    0x0,
     TOUCH_DEFAULT_RESOLUTION_X,
     TOUCH_DEFAULT_RESOLUTION_Y,
     0x0,
     0x0,
     0x0,
     0x0,
-    0x0,
-    TOUCH_DEFAULT_RESOLUTION_X,
-    TOUCH_DEFAULT_RESOLUTION_Y,
     TOUCH_DEFAULT_RESOLUTION_X,
     TOUCH_DEFAULT_RESOLUTION_Y,
     0x0,
